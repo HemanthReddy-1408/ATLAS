@@ -1,0 +1,39 @@
+[project]
+name = "atlas-intel"
+version = "0.1.0"
+description = "Atlas — AI & technology intelligence engine: a living knowledge graph + agentic RAG"
+requires-python = ">=3.12"
+readme = "README.md"
+dependencies = [
+  "beautifulsoup4", "lxml", "httpx", "numpy", "pydantic", "fastapi", "uvicorn",
+  "streamlit", "pandas", "pyyaml", "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+neural = ["sentence-transformers"]
+
+[project.scripts]
+atlas = "atlas.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003", "SIM102", "SIM108", "B905", "RUF012"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["live: calls the real Groq API (needs ATLAS_GROQ_API_KEY)"]
