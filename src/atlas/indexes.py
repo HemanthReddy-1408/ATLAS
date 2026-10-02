@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import itertools
 import math
@@ -22,6 +23,7 @@ STOPWORDS = frozenset(
 _COMPOUND = re.compile(r"[a-z0-9]+(?:[-.][a-z0-9]+)*")
 
 
+@functools.lru_cache(maxsize=65536)
 def stem(t: str) -> str:
     if len(t) <= 3 or t.isdigit() or any(c.isdigit() for c in t):
         return t

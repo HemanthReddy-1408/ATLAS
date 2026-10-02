@@ -83,20 +83,20 @@ class Frontier:
     def __init__(self, repo: Repository, clock: Clock) -> None:
         self.repo, self.clock = repo, clock
 
-    def accepts(self, url: str, src: Source) -> bool:
+    def accepts(self, url: str, src: Source, seed: bool = False) -> bool:
         host = urlsplit(url).hostname or ""
         doms = src.allowed_domains or [urlsplit(src.base_url).hostname or ""]
         if not any(host == d or host.endswith("." + d) for d in doms):
             return False
         if src.exclude_patterns and any(re.search(p, url) for p in src.exclude_patterns):
             return False
-        if src.include_patterns and not any(re.search(p, url) for p in src.include_patterns):
+        if not seed and src.include_patterns and not any(re.search(p, url) for p in src.include_patterns):  # seeds are listing pages
             return False
         return not re.search(r"\.(png|jpe?g|gif|svg|webp|pdf|zip|gz|mp4|mp3|css|js|ico|woff2?)$", url, re.I)
 
     def add(self, url: str, src: Source, depth: int = 0, is_seed: bool = False, base: str | None = None) -> bool:
         n = normalize_url(url, base)
-        if not n or not self.accepts(n, src) or depth > src.max_depth:
+        if not n or not self.accepts(n, src, is_seed) or depth > src.max_depth:
             return False
         if self.repo.url(n):
             return False
@@ -115,7 +115,7 @@ class Frontier:
                 continue
             for seed in src.seed_urls:
                 nu = normalize_url(seed)
-                if nu and self.accepts(nu, src):
+                if nu and self.accepts(nu, src, True):
                     if self.repo.url(nu) is None:
                         self.add(nu, src, 0, True)
                     else:

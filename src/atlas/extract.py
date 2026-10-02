@@ -147,6 +147,24 @@ def _find_main(soup: BeautifulSoup) -> Tag:
     return soup.body or soup
 
 
+_HIDDEN_STYLE = re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0(?:\.0+)?\b|left\s*:\s*-\d{3,}", re.I)
+
+
+def _extract_hidden(soup: BeautifulSoup) -> str:
+    """Text a human reader never sees. It is removed from the document and kept only for the safety scan."""
+    chunks = []
+    for t in soup.find_all(True):
+        if getattr(t, "decomposed", False) or t.attrs is None or t.name in ("html", "body", "head", "script", "style"):
+            continue
+        style = t.get("style") or ""
+        if t.has_attr("hidden") or t.get("aria-hidden") == "true" or _HIDDEN_STYLE.search(style):
+            txt = _clean(t.get_text(" "))
+            if txt:
+                chunks.append(txt)
+            t.decompose()
+    return " ".join(chunks)
+
+
 def _strip_noise(soup: BeautifulSoup) -> None:
     for t in soup.find_all(_NOISE_TAGS):
         t.decompose()
@@ -202,15 +220,18 @@ def parse_html(html: str, url: str) -> ParsedDocument:
     description = _meta(soup, "og:description", "description") or ""
     lang = (soup.html.get("lang") if soup.html else None) or "en"
 
+    hidden = _extract_hidden(soup)
     _strip_noise(soup)
     main = _find_main(soup)
     h1 = main.find("h1") or soup.find("h1")
     if not title and h1:
         title = _clean(h1.get_text(" "))
-    title = _clean(re.split(r"\s+[|–—]\s+", _clean(title))[0]) if title else url
+    title = _clean(re.split(r"\s+[|–—]\s+", _clean(title))[0]).strip("*_# ") if title else url
 
     links: list[str] = []
-    for a in main.find_all("a", href=True):
+    # Links come from the whole de-chromed page, not just the chosen content block: on a listing page every post card
+    # is its own <article>, and the "largest article" heuristic would otherwise hide all but one of them.
+    for a in (soup.body or soup).find_all("a", href=True):
         n = normalize_url(str(a["href"]), url)
         if n and n not in links:
             links.append(n)
@@ -255,7 +276,7 @@ def parse_html(html: str, url: str) -> ParsedDocument:
         if txt:
             cur.blocks.append(Block(kind, txt))
     sections = [s for s in sections if s.blocks]
-    return ParsedDocument(url, title, sections, published, updated, canonical, description, lang, links)
+    return ParsedDocument(url, title, sections, published, updated, canonical, description, lang, links, hidden)
 
 
 def to_markdown(doc: ParsedDocument) -> str:

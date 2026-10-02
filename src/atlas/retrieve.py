@@ -23,12 +23,19 @@ class Filters:
     date_to: str | None = None
     entity_any: frozenset[str] | None = None
     document_ids: frozenset[str] | None = None
+    kinds: frozenset[str] | None = None  # None => ordinary page chunks only; summaries are opt-in
 
     @property
     def empty(self) -> bool:
-        return not any((self.source_types, self.date_from, self.date_to, self.entity_any, self.document_ids))
+        return not any((self.source_types, self.date_from, self.date_to, self.entity_any, self.document_ids, self.kinds))
+
+    def relaxed(self) -> Filters:
+        """Drop the content constraints (dates, sources) but keep the kind scope."""
+        return Filters(kinds=self.kinds)
 
     def matches(self, c: Chunk) -> bool:
+        if c.kind not in (self.kinds or {"chunk"}):
+            return False
         if self.source_types and str(c.source_type) not in self.source_types:
             return False
         if self.document_ids and c.document_id not in self.document_ids:
@@ -67,6 +74,7 @@ class RetrievalConfig:
     diversity: float = 0.25  # 0 = pure relevance, 1 = pure diversity
     graph_hops: int = 2
     graph_active_only: bool = False
+    include_summaries: bool = False
     describe: str = ""
 
 
@@ -221,8 +229,6 @@ class Retrievers:
         self._cache = _Cache()
 
     def _allow(self, f: Filters):
-        if f.empty:
-            return None
         chunks = self.idx.chunks
         return lambda cid: cid in chunks and f.matches(chunks[cid])
 
@@ -352,8 +358,9 @@ class HybridRetriever:
             result = sorted(cands.values(), key=lambda s: (-s.rerank, -s.fused, s.chunk_id))[: self.s.rerank_k]
         else:
             result = sorted(cands.values(), key=lambda s: (-s.fused, s.chunk_id))[: self.s.rerank_k]
+            ceiling = (sum(list_weights.values()) / (self.s.rrf_k + 1)) or 1.0  # best possible RRF score => scale to [0, 1]
             for sc in result:
-                sc.rerank = sc.fused
+                sc.rerank = min(1.0, sc.fused / ceiling)
         for sc in result:
             sc.final = sc.rerank
         trace.reranked = [(s.chunk_id, s.rerank) for s in result]

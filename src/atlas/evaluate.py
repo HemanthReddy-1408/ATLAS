@@ -4,27 +4,29 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .agent import AgentRun
+from .agent import AgentRun, AskOptions
 from .engine import Atlas
 from .evalset import EVAL_SET, EvalItem
 from .fixtures import doc_key_for_url
+from .llm import LLM, LLMError, patient
 
 
 # ------------------------------------------------------------- relevance
 def doc_key(atlas: Atlas, chunk_id: str) -> str | None:
     c = atlas.idx.chunks.get(chunk_id)
-    return doc_key_for_url(c.url) if c else None
+    return (doc_key_for_url(c.url) or c.url) if c else None
 
 
 def relevant_chunks(atlas: Atlas, item: EvalItem) -> set[str]:
     """Chunk-level gold: chunk belongs to a relevant doc and (if phrases are given) contains one of them."""
     out = set()
     for cid, c in atlas.idx.chunks.items():
-        if doc_key_for_url(c.url) in item.relevant_docs:
+        if c.kind == "chunk" and (doc_key_for_url(c.url) or c.url) in item.relevant_docs:
             if not item.relevant_phrases or any(p.lower() in c.text.lower() for p in item.relevant_phrases):
                 out.add(cid)
     return out
@@ -220,3 +222,133 @@ def format_table(rows: list[dict]) -> str:
     line = "  ".join(c.ljust(w[c]) for c in cols)
     return "\n".join([line, "  ".join("-" * w[c] for c in cols), *("  ".join(str(row[c]).ljust(w[c]) for c in cols) for row in rows)])
 
+
+
+# ================================================================ ablations
+ABLATIONS: list[tuple[str, AskOptions]] = [
+    ("full pipeline", AskOptions(use_llm=False)),
+    ("− reranker", AskOptions(use_llm=False, rerank=False)),
+    ("− graph retriever", AskOptions(use_llm=False, use_graph=False)),
+    ("− dense retriever", AskOptions(use_llm=False, use_dense=False)),
+    ("− BM25 retriever", AskOptions(use_llm=False, use_bm25=False)),
+    ("− query decomposition", AskOptions(use_llm=False, decompose=False)),
+    ("− iterative refinement", AskOptions(use_llm=False, refine=False)),
+    ("− corrective grading (CRAG)", AskOptions(use_llm=False, corrective=False)),
+    ("− MMR diversity", AskOptions(use_llm=False, diversity=0.0)),
+    ("+ summary nodes always on", AskOptions(use_llm=False, summaries=True)),
+    ("BM25 only (naive baseline)", AskOptions(use_llm=False, use_dense=False, use_graph=False, rerank=False, decompose=False,
+                                               refine=False, corrective=False, diversity=0.0)),
+]
+
+
+@dataclass
+class AblationRow:
+    config: str
+    evidence_recall: float
+    completeness: float
+    faithfulness: float
+    abstention: float | None
+    avg_evidence: float
+    avg_ms: float
+
+    def row(self) -> dict:
+        return {k: (round(v, 3) if isinstance(v, float) else v) for k, v in asdict(self).items()}
+
+
+def eval_ablation(atlas: Atlas, items: list[EvalItem] | None = None, configs=None, progress=None) -> list[AblationRow]:
+    """Run the whole gold set once per pipeline variant and report the cost of removing each component."""
+    items = items or EVAL_SET
+    rows = []
+    for n, (name, opts) in enumerate(configs or ABLATIONS, 1):
+        rec, comp, faith, ab, ev_n, ms = [], [], [], [], [], []
+        for it in items:
+            t0 = time.perf_counter()
+            run = atlas.ask(it.question, options=opts, use_llm=False)
+            ms.append((time.perf_counter() - t0) * 1e3)
+            if it.abstain:
+                ab.append(float(run.answer_mode == "none"))
+                continue
+            docs = {doc_key(atlas, e.chunk_id) for e in run.evidence}
+            rec.append(len(docs & set(it.relevant_docs)) / len(it.relevant_docs))
+            comp.append(key_point_recall(run.answer, it.key_points))
+            faith.append(run.verification.faithfulness)
+            ev_n.append(len(run.evidence))
+        m = lambda xs: sum(xs) / len(xs) if xs else 0.0  # noqa: E731
+        rows.append(AblationRow(name, m(rec), m(comp), m(faith), m(ab) if ab else None, m(ev_n), m(ms)))
+        if progress:
+            progress(n, len(configs or ABLATIONS), name)
+    return rows
+
+
+# =============================================================== LLM judge
+JUDGE_SYSTEM = (
+    "You are a strict RAG evaluator. Given a question, a reference answer, the system's answer and the evidence it was shown, "
+    'return JSON: {"correctness":0-1,"completeness":0-1,"relevance":0-1,"groundedness":0-1,"useful_evidence":["E1",...]}. '
+    "correctness: agrees with the reference. completeness: covers every part of the reference. relevance: on-topic, no padding. "
+    "groundedness: every statement is supported by the evidence. useful_evidence: ids of evidence items that contribute to the answer."
+)
+
+
+def judge_run(item: EvalItem, run: AgentRun, llm: LLM) -> dict:
+    ev = "\n".join(f"[{e.evidence_id}] {e.title}: {re.sub(chr(10), ' ', e.text)[:170]}" for e in run.evidence[:10])
+    prompt = f"Question: {item.question}\nReference answer: {item.expected}\n\nSystem answer:\n{run.answer[:1100]}\n\nEvidence:\n{ev}"
+    d = llm.complete_json(JUDGE_SYSTEM, prompt, max_tokens=220, fast=True)
+    if not isinstance(d, dict):
+        raise LLMError("judge returned a non-object")
+    useful = [u for u in d.get("useful_evidence", []) if any(u == e.evidence_id for e in run.evidence)]
+    return {"correctness": float(d.get("correctness", 0)), "completeness": float(d.get("completeness", 0)),
+            "relevance": float(d.get("relevance", 0)), "groundedness": float(d.get("groundedness", 0)),
+            "context_precision": len(useful) / len(run.evidence) if run.evidence else 0.0}
+
+
+def eval_judge(atlas: Atlas, items: list[EvalItem], mode: str = "pipeline", progress=None) -> list[dict]:
+    """RAGAS-style scores from an LLM judge (Groq): correctness, completeness, relevance, groundedness, context precision."""
+    if atlas.llm is None:
+        raise LLMError("the judge needs an LLM")
+    out = []
+    with patient(atlas.llm):
+        for n, it in enumerate([i for i in items if not i.abstain], 1):
+            run = atlas.ask(it.question, mode=mode)
+            try:
+                out.append({"id": it.id, "question": it.question, **judge_run(it, run, atlas.llm)})
+            except LLMError as e:
+                out.append({"id": it.id, "question": it.question, "error": str(e)[:120]})
+            if progress:
+                progress(n, len(items), it.question)
+    return out
+
+
+def summarize_judge(rows: list[dict]) -> dict:
+    ok = [r for r in rows if "error" not in r]
+    keys = ["correctness", "completeness", "relevance", "groundedness", "context_precision"]
+    return {k: round(sum(r[k] for r in ok) / len(ok), 3) if ok else None for k in keys} | {"judged": len(ok), "errors": len(rows) - len(ok)}
+
+
+# ======================================================== synthetic questions
+def generate_questions(atlas: Atlas, n: int, llm: LLM) -> list[EvalItem]:
+    """Grow the gold set: the LLM writes a question + verbatim answer span for passages sampled from distinct documents.
+    A generated item is kept only if its span really occurs in the passage (guards against invented answers)."""
+    pool = [c for c in atlas.idx.chunks.values() if c.kind == "chunk" and c.token_count >= 40]
+    pool.sort(key=lambda c: c.chunk_id)
+    seen_docs, items = set(), []
+    step = max(1, len(pool) // max(n * 2, 1))
+    for c in pool[::step]:
+        if len(items) >= n:
+            break
+        if c.document_id in seen_docs:
+            continue
+        try:
+            with patient(llm):
+                d = llm.complete_json(
+                    "Write ONE specific factual question that can only be answered from the passage, and the shortest verbatim span "
+                    'from the passage that answers it. Return JSON {"question": "...", "answer_span": "..."}.',
+                    f"Passage ({c.title}):\n{c.text[:900]}", max_tokens=140, fast=True)
+        except LLMError:
+            continue
+        if not isinstance(d, dict) or not d.get("question") or str(d.get("answer_span", "")).lower() not in c.text.lower():
+            continue
+        seen_docs.add(c.document_id)
+        span = str(d["answer_span"]).strip()
+        items.append(EvalItem(f"syn{len(items) + 1}", str(d["question"]).strip(), "FACTUAL", span, [doc_key(atlas, c.chunk_id) or c.url],
+                              [span], [span]))
+    return items

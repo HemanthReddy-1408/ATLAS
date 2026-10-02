@@ -13,7 +13,7 @@ import httpx
 from .clock import Clock
 from .config import Settings
 from .domain import AUTHORITY, Chunk, ParsedDocument, Source, UrlState
-from .extract import content_hash, diff_documents, parse_html, raw_hash
+from .extract import content_hash, diff_documents, extract_dates, parse_html, raw_hash
 from .indexes import IndexManager
 from .ingest import Crawler, Frontier
 from .process import (
@@ -24,6 +24,7 @@ from .process import (
     count_tokens,
     split_sentences,
 )
+from .safety import scan
 from .store import Repository
 
 log = logging.getLogger("atlas.pipeline")
@@ -44,6 +45,7 @@ class RunReport:
     embedded: int = 0
     relations_new: int = 0
     relations_retired: int = 0
+    quarantined: int = 0
     discovered: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -172,11 +174,29 @@ class Updater:
                     source_type=str(src.source_type), published_at=parsed.published_at or parsed.updated_at,
                     version=version, created_at=now)
         chunks = chunk_document(parsed, doc_id, self.s, meta)
-        new, refreshed = [], []
+        new, refreshed, clean = [], [], []
         keep = {c.chunk_id for c in chunks}
+        hidden = scan(parsed.hidden_text) if parsed.hidden_text else None
         with self.repo.db.tx():
+            if hidden and hidden.suspicious:  # instructions hidden from readers but visible to a model: keep for audit only
+                hc = Chunk(chunk_id=hashlib.sha1(f"{doc_id}|hidden|{parsed.hidden_text}".encode()).hexdigest()[:16],
+                        document_id=doc_id, text=parsed.hidden_text, section_title="(hidden text)", ordinal=999,
+                        token_count=count_tokens(parsed.hidden_text), **meta)
+                hc.risk = max(hidden.score, 0.75)
+                self.repo.upsert_chunk(hc, now, True, "hidden text: " + hidden.notes())
+                keep.add(hc.chunk_id)
+                rep.quarantined += 1
             for c in chunks:
+                sc = scan(c.text)
+                c.risk = sc.score
+                if sc.quarantine:
+                    self.repo.upsert_chunk(c, now, True, sc.notes())
+                    self.repo.set_chunk_entities(c.chunk_id, set())
+                    rep.quarantined += 1
+                    log.warning("quarantined chunk %s of %s: %s", c.chunk_id, parsed.url, sc.notes())
+                    continue
                 is_new = self.repo.upsert_chunk(c, now)
+                clean.append(c)
                 ents: set[str] = set()
                 for m in self.res.extract(c.text):
                     ents.add(m.entity_id)
@@ -184,17 +204,45 @@ class Updater:
                 self.repo.set_chunk_entities(c.chunk_id, ents)
                 (new if is_new else refreshed).append(c)
             gone = self.repo.deactivate_chunks(doc_id, keep, now)
-            self._reconcile_relations(doc_id, chunks, parsed.published_at, version, now, rep, AUTHORITY.get(str(src.source_type), 0.5))
+            self._reconcile_relations(doc_id, clean, parsed.published_at, version, now, rep, AUTHORITY.get(str(src.source_type), 0.5))
+            summary = self._doc_summary(doc_id, parsed, clean, meta)
+            if summary is not None:
+                keep.add(summary.chunk_id)
+                (new if self.repo.upsert_chunk(summary, now) else refreshed).append(summary)
+                self.repo.set_chunk_entities(summary.chunk_id, set(summary.entity_ids))
         rep.chunks_new += len(new)
         rep.chunks_reused += len(refreshed)
         rep.chunks_removed += len(gone)
         rep.embedded += self.idx.apply(new, refreshed, gone)
+
+    def _doc_summary(self, doc_id: str, parsed, clean: list[Chunk], meta: dict) -> Chunk | None:
+        """Extractive document-level node (title + lead sentence of every *scanned, clean* section) for broad queries.
+        Derived nodes are built from clean chunks only and scanned again: a quarantined sentence must never leak back in."""
+        if not clean:
+            return None
+        parts, seen = [parsed.title + "."], set()
+        for c in clean:
+            if c.section_title in seen:
+                continue
+            seen.add(c.section_title)
+            first = split_sentences(c.text)
+            if first:
+                parts.append(first[0][2].strip().lstrip("- "))
+            if len(parts) > 6:
+                break
+        text = " ".join(parts)
+        if count_tokens(text) < 12 or scan(text).suspicious:
+            return None
+        ents = sorted({e for c in clean for e in c.entity_ids})
+        cid = hashlib.sha1(f"{doc_id}|summary|{text}".encode()).hexdigest()[:16]
+        return Chunk(cid, doc_id, text, "Document summary", 1000, count_tokens(text), entity_ids=tuple(ents), kind="doc_summary", **meta)
 
     def _reconcile_relations(self, doc_id: str, chunks: list[Chunk], doc_date: str | None, version: int,
                              now: str, rep: RunReport, authority: float = 1.0) -> None:
         """Graph reconciliation: facts re-observed stay active; facts no longer stated get valid_until=now."""
         before = self.repo.doc_relations(doc_id)
         current: dict[str, object] = {}
+        ranks: dict[str, tuple[bool, float]] = {}
         for c in chunks:
             for s_start, s_end, sent in split_sentences(c.text):
                 ms = [m for m in self.res.extract(c.text[s_start:s_end])]
@@ -205,6 +253,10 @@ class Updater:
                     if x.confidence < 0.5:
                         continue
                     r = build_relation(x, doc_id, c.chunk_id, now, version)
+                    rank = (bool(extract_dates(x.sentence)), x.confidence)  # same triple twice on a page: keep the best-dated sentence
+                    if r.relation_id in current and ranks[r.relation_id] >= rank:
+                        continue
+                    ranks[r.relation_id] = rank
                     if r.relation_id in before:
                         r.first_version = before[r.relation_id].first_version
                         r.valid_from = before[r.relation_id].valid_from or r.valid_from

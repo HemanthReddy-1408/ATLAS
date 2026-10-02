@@ -10,7 +10,7 @@ from .domain import Source, SourceType
 
 LIVE_SOURCES: list[Source] = [
     Source("hf-blog", "Hugging Face Blog", "https://huggingface.co/blog", SourceType.TECHNICAL_BLOG,
-           seed_urls=["https://huggingface.co/blog"], allowed_domains=["huggingface.co"], include_patterns=[r"/blog/[^/]+$"],
+           seed_urls=["https://huggingface.co/blog"], allowed_domains=["huggingface.co"], include_patterns=[r"/blog/[^/]+(/[^/]+)?$"], exclude_patterns=[r"/blog/(feed\.xml|community)$"],
            priority=6, crawl_frequency_s=6 * 3600, max_depth=1),
     Source("openai-news", "OpenAI", "https://openai.com/news/", SourceType.OFFICIAL,
            seed_urls=["https://openai.com/news/"], allowed_domains=["openai.com"], include_patterns=[r"/(index|news)/[^/]+/?$"],

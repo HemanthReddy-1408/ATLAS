@@ -131,9 +131,9 @@ async def test_robots_policy_rules():
 def test_first_crawl_respects_robots_and_builds_all_layers(fresh, site):
     rep = fresh.load_fixtures(1, site)
     st = fresh.stats()
-    assert rep.new_docs == 31 and rep.failed == 0 and rep.skipped_robots >= 17
+    assert rep.new_docs == 32 and rep.failed == 0 and rep.skipped_robots >= 17
     assert not any("/private/" in u or "/drafts/" in u for u in site.hits)  # disallowed paths are never requested
-    assert st["chunks"] == st["vectors"] > 30 and st["relations"] > 40 and st["graph_edges"] == st["relations"]
+    assert st["chunks"] + st["summaries"] == st["vectors"] and st["chunks"] > 30 and st["relations"] > 40 and st["graph_edges"] == st["relations"]
     assert fresh.repo.url("https://nvidia.example/drafts/unreleased-roadmap").state == UrlState.SKIPPED
 
 
@@ -141,7 +141,7 @@ def test_second_crawl_is_incremental(fresh):
     r1 = fresh.load_fixtures(1)
     r2 = fresh.load_fixtures(2)
     assert r2.unchanged_docs >= 40  # byte-identical pages short-circuit via ETag / hash
-    assert r2.changed_docs == 2 and r2.new_docs == 3 and r2.gone_docs == 1
+    assert r2.changed_docs == 2 and r2.new_docs == 4 and r2.gone_docs == 1
     assert r2.embedded == r2.chunks_new < r1.embedded  # only new chunks are embedded
     assert r2.chunks_reused >= 1  # unchanged paragraphs of edited pages keep their chunk id
     hub = fresh.repo.document_by_url("https://meta-ai.example/models/llama")
@@ -178,7 +178,7 @@ def test_graph_reconciliation_retires_facts_no_longer_stated():
 def test_one_bad_page_does_not_kill_the_crawl(fresh, site):
     site.flaky["https://openai.example/news/gpt-4"] = 99
     rep = fresh.load_fixtures(1, site)
-    assert rep.failed == 1 and rep.new_docs == 30
+    assert rep.failed == 1 and rep.new_docs == 31
     assert fresh.repo.url("https://openai.example/news/gpt-4").state == UrlState.FAILED
 
 
@@ -186,3 +186,33 @@ def test_one_bad_page_does_not_kill_the_crawl(fresh, site):
 def test_every_chunk_carries_provenance(corpus, field):
     for c in corpus.idx.chunks.values():
         assert c.url and c.source_name and c.source_type and getattr(c, field)
+
+
+# --------------------------------------- real-world extraction regressions
+LISTING = """<html><head><title>Blog</title></head><body><nav><a href="/menu">Menu</a></nav><main>
+<article><a href="/blog/org-a/post-one"><h3>**Post one**</h3></a></article>
+<article><a href="/blog/org-b/post-two"><h3>Post two</h3></a></article>
+<article><a href="/blog/post-three"><h3>Post three</h3></a></article>
+<article><a href="/blog/feed.xml">feed</a></article></main><footer><a href="/privacy">Privacy</a></footer></body></html>"""
+
+
+def test_listing_pages_yield_every_post_link_not_just_the_largest_card():
+    d = parse_html(LISTING, "https://x.example/blog")
+    assert {"https://x.example/blog/org-a/post-one", "https://x.example/blog/org-b/post-two", "https://x.example/blog/post-three"} <= set(d.links)
+    assert "https://x.example/privacy" not in d.links and "https://x.example/menu" not in d.links  # chrome is still excluded
+
+
+def test_seed_listing_pages_bypass_include_patterns_but_discovered_links_do_not(fresh):
+    src = Source("s", "S", "https://x.example/blog", "technical_blog", seed_urls=["https://x.example/blog"], allowed_domains=["x.example"],
+                 include_patterns=[r"/blog/[^/]+(/[^/]+)?$"], exclude_patterns=[r"feed\.xml$"])
+    fresh.repo.upsert_source(src)
+    f = Frontier(fresh.repo, fresh.clock)
+    assert f.add("https://x.example/blog", src, 0, is_seed=True)       # the listing page itself
+    assert not f.add("https://x.example/about", src, 1)                 # discovered link outside the pattern
+    assert f.add("https://x.example/blog/org/slug", src, 1) and not f.add("https://x.example/blog/feed.xml", src, 1)
+
+
+def test_markdown_decoration_is_stripped_from_titles():
+    d = parse_html("<html><head><meta property='og:title' content='**Bold title** | Site'></head><body><article><h1>x</h1><p>"
+                   + "word " * 40 + "</p></article></body></html>", "https://x.example/p")
+    assert d.title == "Bold title"

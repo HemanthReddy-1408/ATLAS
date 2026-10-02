@@ -124,6 +124,7 @@ class ParsedDocument:
     description: str = ""
     language: str = "en"
     links: list[str] = field(default_factory=list)
+    hidden_text: str = ""  # text present in the DOM but invisible to readers (display:none, aria-hidden, …)
 
     @property
     def text(self) -> str:
@@ -173,6 +174,8 @@ class Chunk:
     created_at: str = ""
     active: bool = True
     entity_ids: tuple[str, ...] = ()
+    kind: str = "chunk"  # chunk | doc_summary | community
+    risk: float = 0.0  # prompt-injection score from atlas.safety
 
     @property
     def contextual_text(self) -> str:

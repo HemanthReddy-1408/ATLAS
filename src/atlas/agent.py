@@ -7,8 +7,11 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .corrective import CorrectiveGrader, Grade, GradedChunk
 from .domain import Evidence, QueryType
 from .generate import ContextResult, VerificationReport
+from .indexes import tokenize
+from .llm import LLM
 from .observe import METRICS, Trace
 from .ontology import REL_LABEL
 from .query import (
@@ -22,6 +25,7 @@ from .query import (
     route,
 )
 from .retrieve import Filters, RetrievalConfig, RetrievalResult, ScoredChunk, Variant
+from .safety import sanitize_output
 
 if TYPE_CHECKING:
     from .engine import Atlas
@@ -197,6 +201,47 @@ class Tools:
         return {"hits": hits[:k]}
 
 
+# ---------------------------------------------------------------- options
+@dataclass(frozen=True)
+class AskOptions:
+    """Every stage can be switched off, which is what makes ablation studies possible."""
+
+    use_llm: bool = True
+    llm_judge: bool = False
+    rerank: bool = True
+    use_bm25: bool = True
+    use_dense: bool = True
+    use_graph: bool = True
+    decompose: bool | None = None  # None = let the router decide
+    hyde: bool | None = None
+    summaries: bool | None = None  # community / document summary nodes; None = router decides
+    diversity: float | None = None
+    refine: bool = True  # iterative retrieval (assess → refine → retrieve again)
+    corrective: bool = True  # CRAG grading + knowledge refinement
+    max_iterations: int | None = None
+
+    def label(self) -> str:
+        off = [k for k, v in dataclasses.asdict(self).items() if v is False and k not in ("llm_judge", "use_llm")]
+        return "full pipeline" if not off else "without " + ", ".join(off)
+
+
+def _apply_options(cfg: RetrievalConfig, o: AskOptions) -> RetrievalConfig:
+    w = dict(cfg.weights)
+    for flag, key in ((o.use_graph, "graph"), (o.use_dense, "dense"), (o.use_bm25, "bm25")):
+        if not flag:
+            w[key] = 0.0
+    cfg = dataclasses.replace(cfg, weights=w, rerank=o.rerank)
+    if o.decompose is not None:
+        cfg = dataclasses.replace(cfg, decompose=o.decompose)
+    if o.hyde is not None:
+        cfg = dataclasses.replace(cfg, hyde=o.hyde)
+    if o.diversity is not None:
+        cfg = dataclasses.replace(cfg, diversity=o.diversity)
+    summaries = cfg.include_summaries if o.summaries is None else o.summaries
+    kinds = frozenset({"chunk", "doc_summary", "community"}) if summaries else None
+    return dataclasses.replace(cfg, include_summaries=summaries, filters=dataclasses.replace(cfg.filters, kinds=kinds))
+
+
 # ----------------------------------------------------------------- state
 @dataclass
 class StepState:
@@ -209,6 +254,22 @@ class StepState:
     reason: str = ""
     attempts: int = 0
     actions: list[str] = field(default_factory=list)
+    grades: dict[str, GradedChunk] = field(default_factory=dict)
+    rejected: list[str] = field(default_factory=list)  # chunk ids removed by the corrective grader
+
+
+@dataclass
+class Retrieved:
+    """Output of the research phase: what was understood, planned and found."""
+
+    analysis: QueryAnalysis
+    cfg: RetrievalConfig
+    subs: list[SubQuestion]
+    steps: list[StepState]
+    candidates: list[ScoredChunk]
+    facts: list
+    iterations: int
+    refined: dict[str, str]
 
 
 @dataclass
@@ -226,6 +287,12 @@ class AgentRun:
     trace: Trace
     iterations: int
     llm_stats: dict = field(default_factory=dict)
+    options: AskOptions = field(default_factory=AskOptions)
+    cache_hit: bool = False
+    standalone_question: str = ""
+    mode: str = "pipeline"
+    transcript: list = field(default_factory=list)  # tool calls / agent messages, for the autonomous & multi-agent modes
+    conflicts: list = field(default_factory=list)
 
     @property
     def evidence(self) -> list[Evidence]:
@@ -234,17 +301,34 @@ class AgentRun:
 
 # ----------------------------------------------------------------- agent
 class ResearchAgent:
+    """Deterministic plan → retrieve → grade → assess → refine → answer → verify pipeline (the 'workflow' agent)."""
+
     STRONG = 0.30  # reranker score at which a chunk counts as relevant evidence
 
     def __init__(self, atlas: Atlas) -> None:
         self.a = atlas
         self.tools = Tools(atlas)
+        self.grader = CorrectiveGrader(atlas.idx)
+
+    # ---- knowledge-gap detection
+    def _unknown_terms(self, text: str, has_entities: bool) -> list[str]:
+        """Terms the index has never seen. With no recognised entity and mostly unseen content words, the topic is simply
+        not in the knowledge base: say so instead of returning the nearest-looking noise."""
+        if has_entities:
+            return []
+        words = [w for w in dict.fromkeys(tokenize(text, keep_stop=False)) if w.isalpha() and len(w) >= 4]
+        unseen = [w for w in words if w not in self.a.idx.bm25.postings]
+        return unseen if len(unseen) >= 2 and len(unseen) >= 0.6 * len(words) else []
 
     # ---- assessment
     def _assess(self, st: StepState, qtype: QueryType) -> None:
+        st.sub.gap = self._unknown_terms(st.sub.text, bool(st.entity_ids))
+        if st.sub.gap:
+            st.sufficient, st.reason = False, "knowledge gap: the knowledge base has never seen " + ", ".join(st.sub.gap)
+            return
         res = st.result
         if res is None or not res.candidates:
-            st.sufficient, st.reason = False, "no candidates retrieved"
+            st.sufficient, st.reason = False, "no candidates retrieved" + (f" ({len(st.rejected)} rejected by grader)" if st.rejected else "")
             return
         strong = [c for c in res.candidates if c.rerank >= self.STRONG]
         need = 2 if qtype in (QueryType.EXPLORATORY, QueryType.MULTI_HOP, QueryType.COMPARATIVE, QueryType.TEMPORAL) and st.sub.kind != "window" else 1
@@ -273,9 +357,9 @@ class ResearchAgent:
                 st.variants.append(Variant(st.sub.text + " " + " ".join(ex or an.keywords[:4]), 0.6, "expansion"))
                 st.variants.append(Variant(hyde_template(an), 0.5, "hyde"))
                 st.cfg = dataclasses.replace(st.cfg, hyde=True)
-            elif action == "relax_filters" and not st.cfg.filters.empty:
-                st.cfg = dataclasses.replace(st.cfg, filters=Filters())
-            elif action == "graph_bridge" and st.entity_ids:
+            elif action == "relax_filters" and st.cfg.filters != st.cfg.filters.relaxed():
+                st.cfg = dataclasses.replace(st.cfg, filters=st.cfg.filters.relaxed())
+            elif action == "graph_bridge" and st.entity_ids and st.cfg.weights.get("graph", 1) >= 0:
                 g = self.a.idx.graph
                 extra = {o for e in st.entity_ids for _, o in g.edges(e)[:6]}
                 st.entity_ids = list(dict.fromkeys([*st.entity_ids, *sorted(extra)]))[:10]
@@ -294,9 +378,11 @@ class ResearchAgent:
             return True
         return False
 
-    def _should_abstain(self, an: QueryAnalysis, ctx: ContextResult) -> bool:
+    def _should_abstain(self, an: QueryAnalysis, ctx: ContextResult, subs: list[SubQuestion] | None = None) -> bool:
         """Refuse rather than guess: nothing retrieved, or none of the entities the user asked about appear in any evidence."""
         if not ctx.evidence:
+            return True
+        if subs and all(s.gap for s in subs if s.kind != "window"):
             return True
         if an.entity_ids:
             seen: set[str] = set()
@@ -308,18 +394,17 @@ class ResearchAgent:
                 return True
         return max(e.rerank_score for e in ctx.evidence) < 0.12
 
-    # ---- main loop
-    def run(self, question: str, *, use_llm: bool = True, max_iterations: int | None = None, llm_judge: bool = False) -> AgentRun:
+    # ---- phase 1: understand, plan, retrieve (with grading and refinement)
+    def research(self, question: str, opts: AskOptions, trace: Trace, llm: LLM | None) -> Retrieved:
         a = self.a
-        trace = Trace()
-        llm = a.llm if use_llm else None
-        max_it = max_iterations or a.settings.max_agent_iterations
-        METRICS.inc("queries")
+        max_it = opts.max_iterations or a.settings.max_agent_iterations
+        if not opts.refine:
+            max_it = 1
         with trace.span("understand") as sp:
             an = a.understanding.analyze(question)
             sp.attrs.update(an.summary())
-        cfg = route(an, llm is not None)
-        trace.event("route", config=cfg.describe, weights=str(cfg.weights), filters=cfg.filters.describe())
+        cfg = _apply_options(route(an, llm is not None), opts)
+        trace.event("route", config=cfg.describe, weights=str(cfg.weights), filters=cfg.filters.describe(), summaries=cfg.include_summaries)
         with trace.span("plan"):
             subs = decompose(an, a.resolver, llm) if cfg.decompose else [SubQuestion("s1", question, "main", an.entity_ids)]
             hyde_cache: dict[str, str] = {}
@@ -339,17 +424,23 @@ class ResearchAgent:
             for st in todo:
                 with trace.span("retrieve", step=st.sub.step_id, iteration=it + 1, query=st.sub.text) as sp:
                     st.result = a.retrievers.retrieve(st.sub.text, st.entity_ids, an.rel_hints, st.variants, st.cfg, st.sub.step_id)
+                    if opts.corrective and st.result.candidates:
+                        st.grades = self.grader.grade(st.sub.text, st.entity_ids or an.entity_ids, st.result.candidates, llm)
+                        st.rejected = [c.chunk_id for c in st.result.candidates if st.grades.get(c.chunk_id) and st.grades[c.chunk_id].grade == Grade.INCORRECT]
+                        st.result.candidates = [c for c in st.result.candidates if c.chunk_id not in set(st.rejected)]
                     self._assess(st, an.qtype)
-                    sp.attrs.update(sufficient=st.sufficient, reason=st.reason, candidates=len(st.result.candidates))
+                    counts = {g.value: sum(1 for x in st.grades.values() if x.grade == g) for g in Grade}
+                    sp.attrs.update(sufficient=st.sufficient, reason=st.reason, candidates=len(st.result.candidates), **({"grades": str(counts)} if st.grades else {}))
                 if not st.sufficient and it < max_it - 1:
                     self._refine(st, an, trace)
-        # merge the per-step candidate lists
         merged: dict[str, ScoredChunk] = {}
         facts = []
+        refined: dict[str, str] = {}
         for st in steps:
-            if not st.result:
+            if not st.result or st.sub.gap:
                 continue
             facts.extend(st.result.trace.graph_facts)
+            refined.update({cid: g.refined for cid, g in st.grades.items() if g.refined})
             for c in st.result.candidates:
                 m = merged.get(c.chunk_id)
                 if m is None:
@@ -363,24 +454,34 @@ class ResearchAgent:
                     m.via = list(dict.fromkeys([*m.via, *c.via]))
         seen_f: set[str] = set()
         facts = [f for f in facts if not (f.relation_id in seen_f or seen_f.add(f.relation_id))]
+        return Retrieved(an, cfg, subs, steps, list(merged.values()), facts, iterations, refined)
+
+    # ---- phase 2: context, write, verify
+    def answer(self, question: str, rt: Retrieved, opts: AskOptions, trace: Trace, llm: LLM | None, *, notes: str = "") -> AgentRun:
+        a = self.a
+        an, cfg, subs = rt.analysis, rt.cfg, rt.subs
         n_real = len([s for s in subs if s.kind != "window"])
+        simple = an.qtype in (QueryType.FACTUAL, QueryType.RELATIONAL) and not an.complex and "identify_entities" not in an.operations
         with trace.span("context") as sp:
-            ctx = a.context.build(list(merged.values()), an, cfg, question, facts, max_evidence=(5 if an.qtype in (QueryType.FACTUAL, QueryType.RELATIONAL) and not an.complex and "identify_entities" not in an.operations else min(12, a.settings.final_evidence + max(0, n_real - 1))))
+            ctx = a.context.build(rt.candidates, an, cfg, question, rt.facts,
+                                  max_evidence=5 if simple else min(12, a.settings.final_evidence + max(0, n_real - 1)), refined=rt.refined)
             sp.attrs.update(ctx.stats)
-        abstain = self._should_abstain(an, ctx)
+        abstain = self._should_abstain(an, ctx, subs)
         with trace.span("generate") as sp:
             gctx = dataclasses.replace(ctx, evidence=[], facts=[]) if abstain else ctx
-            raw, mode = a.generator.generate(question, an, subs, gctx, use_llm=use_llm)
-            sp.attrs.update(mode=mode)
+            raw, mode = a.generator.generate(question, an, subs, gctx, use_llm=opts.use_llm, notes=notes)
+            raw = sanitize_output(raw, {e.url for e in gctx.evidence})
+            sp.attrs.update(mode=mode, **({"llm_fallback": a.generator.last_error} if a.generator.last_error and mode == "extractive" else {}))
         with trace.span("verify") as sp:
             rep = a.verifier.verify(raw, gctx.evidence)
-            if llm_judge and llm and mode == "llm":
+            if opts.llm_judge and llm and mode == "llm":
                 rep = a.verifier.judge(rep, gctx.evidence, llm)
             regenerated = False
             if rep.unsupported and mode == "llm":
                 fb = "\n".join(f"- unsupported: {c.text}" for c in rep.unsupported[:5])
-                raw2, mode2 = a.generator.generate(question, an, subs, gctx, feedback=fb, use_llm=use_llm)
+                raw2, mode2 = a.generator.generate(question, an, subs, gctx, feedback=fb, use_llm=opts.use_llm, notes=notes)
                 if mode2 == "llm":
+                    raw2 = sanitize_output(raw2, {e.url for e in gctx.evidence})
                     rep2 = a.verifier.verify(raw2, gctx.evidence)
                     if len(rep2.unsupported) <= len(rep.unsupported):
                         raw, rep, regenerated = raw2, rep2, True
@@ -389,5 +490,16 @@ class ResearchAgent:
                 rep = a.verifier.verify(final, gctx.evidence)
             sp.attrs.update(faithfulness=round(rep.faithfulness, 3), unsupported=len(rep.unsupported), regenerated=regenerated)
         METRICS.observe("latency_ms.query", trace.total_ms)
-        return AgentRun(question, an, cfg.describe, steps, ctx, final, raw, mode, rep, regenerated, trace, iterations,
-                        llm.stats.as_dict() if llm else {})
+        return AgentRun(question, an, cfg.describe, rt.steps, ctx, final, raw, mode, rep, regenerated, trace, rt.iterations,
+                        llm.stats.as_dict() if llm else {}, opts)
+
+    def run(self, question: str, *, use_llm: bool = True, max_iterations: int | None = None, llm_judge: bool = False,
+            options: AskOptions | None = None, trace: Trace | None = None) -> AgentRun:
+        opts = options or AskOptions(use_llm=use_llm, llm_judge=llm_judge, max_iterations=max_iterations)
+        if options is not None:
+            opts = dataclasses.replace(opts, use_llm=opts.use_llm and use_llm)
+        trace = trace or Trace()
+        llm = self.a.llm if opts.use_llm else None
+        METRICS.inc("queries")
+        rt = self.research(question, opts, trace, llm)
+        return self.answer(question, rt, opts, trace, llm)

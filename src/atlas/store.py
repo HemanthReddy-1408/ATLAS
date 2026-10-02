@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS chunks(
   chunk_id TEXT PRIMARY KEY, document_id TEXT NOT NULL, text TEXT NOT NULL, section_title TEXT, ordinal INTEGER,
   token_count INTEGER, title TEXT, url TEXT, source_id TEXT, source_name TEXT, source_type TEXT,
   published_at TEXT, first_version INTEGER, last_version INTEGER, created_at TEXT, valid_until TEXT,
-  active INTEGER NOT NULL DEFAULT 1);
+  active INTEGER NOT NULL DEFAULT 1, kind TEXT NOT NULL DEFAULT 'chunk', quarantined INTEGER NOT NULL DEFAULT 0,
+  risk REAL NOT NULL DEFAULT 0, risk_notes TEXT);
 CREATE INDEX IF NOT EXISTS chunks_doc ON chunks(document_id, active);
 CREATE TABLE IF NOT EXISTS chunk_vectors(chunk_id TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS entities(
@@ -236,18 +237,18 @@ class Repository:
         return Chunk(r["chunk_id"], r["document_id"], r["text"], r["section_title"] or "", r["ordinal"] or 0,
                      r["token_count"] or 0, r["title"] or "", r["url"] or "", r["source_id"] or "",
                      r["source_name"] or "", r["source_type"] or "", r["published_at"], r["last_version"] or 1,
-                     r["created_at"] or "", bool(r["active"]), ents)
+                     r["created_at"] or "", bool(r["active"]), ents, r["kind"] or "chunk", r["risk"] or 0.0)
 
     def doc_chunks(self, document_id: str, active_only: bool = True) -> list[Chunk]:
-        q = "SELECT * FROM chunks WHERE document_id=?" + (" AND active=1" if active_only else "") + " ORDER BY ordinal"
+        q = "SELECT * FROM chunks WHERE document_id=?" + (" AND active=1 AND quarantined=0" if active_only else "") + " ORDER BY ordinal"
         return [self._chunk(r, self.chunk_entities(r["chunk_id"])) for r in self.db.rows(q, (document_id,))]
 
     def all_active_chunks(self) -> list[Chunk]:
         ents: dict[str, list[str]] = {}
-        for r in self.db.rows("SELECT ce.chunk_id, ce.entity_id FROM chunk_entities ce JOIN chunks c USING(chunk_id) WHERE c.active=1"):
+        for r in self.db.rows("SELECT ce.chunk_id, ce.entity_id FROM chunk_entities ce JOIN chunks c USING(chunk_id) WHERE c.active=1 AND c.quarantined=0"):
             ents.setdefault(r["chunk_id"], []).append(r["entity_id"])
         return [self._chunk(r, tuple(ents.get(r["chunk_id"], ()))) for r in
-                self.db.rows("SELECT * FROM chunks WHERE active=1 ORDER BY document_id, ordinal")]
+                self.db.rows("SELECT * FROM chunks WHERE active=1 AND quarantined=0 ORDER BY document_id, ordinal")]
 
     def chunk(self, chunk_id: str) -> Chunk | None:
         r = self.db.one("SELECT * FROM chunks WHERE chunk_id=?", (chunk_id,))
@@ -256,22 +257,24 @@ class Repository:
     def chunk_entities(self, chunk_id: str) -> tuple[str, ...]:
         return tuple(r["entity_id"] for r in self.db.rows("SELECT entity_id FROM chunk_entities WHERE chunk_id=?", (chunk_id,)))
 
-    def upsert_chunk(self, c: Chunk, ts: str) -> bool:
+    def upsert_chunk(self, c: Chunk, ts: str, quarantined: bool = False, risk_notes: str = "") -> bool:
         """Insert or refresh a chunk. Returns True if the chunk is *new* (needs embedding)."""
         existing = self.db.one("SELECT chunk_id FROM chunks WHERE chunk_id=?", (c.chunk_id,))
         if existing:
             self.db.execute(
                 """UPDATE chunks SET ordinal=?, section_title=?, title=?, url=?, source_name=?, source_type=?,
-                   published_at=?, last_version=?, active=1, valid_until=NULL WHERE chunk_id=?""",
-                (c.ordinal, c.section_title, c.title, c.url, c.source_name, c.source_type, c.published_at, c.version, c.chunk_id),
+                   published_at=?, last_version=?, active=1, valid_until=NULL, kind=?, risk=?, quarantined=? WHERE chunk_id=?""",
+                (c.ordinal, c.section_title, c.title, c.url, c.source_name, c.source_type, c.published_at, c.version, c.kind,
+                 c.risk, int(quarantined), c.chunk_id),
             )
             return False
         self.db.execute(
             """INSERT INTO chunks(chunk_id,document_id,text,section_title,ordinal,token_count,title,url,source_id,
-               source_name,source_type,published_at,first_version,last_version,created_at,active)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+               source_name,source_type,published_at,first_version,last_version,created_at,active,kind,quarantined,risk,risk_notes)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)""",
             (c.chunk_id, c.document_id, c.text, c.section_title, c.ordinal, c.token_count, c.title, c.url,
-             c.source_id, c.source_name, str(c.source_type), c.published_at, c.version, c.version, ts),
+             c.source_id, c.source_name, str(c.source_type), c.published_at, c.version, c.version, ts, c.kind,
+             int(quarantined), c.risk, risk_notes),
         )
         return True
 
@@ -294,7 +297,7 @@ class Repository:
 
     def vectors(self, model: str) -> dict[str, np.ndarray]:
         rs = self.db.rows(
-            "SELECT v.chunk_id, v.vec FROM chunk_vectors v JOIN chunks c USING(chunk_id) WHERE v.model=? AND c.active=1", (model,)
+            "SELECT v.chunk_id, v.vec FROM chunk_vectors v JOIN chunks c USING(chunk_id) WHERE v.model=? AND c.active=1 AND c.quarantined=0", (model,)
         )
         return {r["chunk_id"]: np.frombuffer(r["vec"], dtype=np.float32) for r in rs}
 
@@ -352,12 +355,23 @@ class Repository:
     def retire_relation(self, relation_id: str, ts: str) -> None:
         self.db.execute("UPDATE relations SET active=0, valid_until=? WHERE relation_id=?", (ts, relation_id))
 
+    def quarantined_chunks(self) -> list[sqlite3.Row]:
+        return self.db.rows("SELECT chunk_id, title, url, source_name, text, risk, risk_notes FROM chunks WHERE quarantined=1 AND active=1 ORDER BY risk DESC")
+
+    def deactivate_kind(self, kind: str, keep: set[str], ts: str) -> list[str]:
+        gone = [r["chunk_id"] for r in self.db.rows("SELECT chunk_id FROM chunks WHERE kind=? AND active=1", (kind,)) if r["chunk_id"] not in keep]
+        for cid in gone:
+            self.db.execute("UPDATE chunks SET active=0, valid_until=? WHERE chunk_id=?", (ts, cid))
+        return gone
+
     # -------------------------------------------------------------- misc
     def stats(self) -> dict[str, int]:
         q = lambda t, w="": self.db.one(f"SELECT COUNT(*) n FROM {t} {w}")["n"]  # noqa: E731
         return {
             "sources": q("sources"), "urls": q("urls"), "documents": q("documents"),
-            "versions": q("document_versions"), "chunks": q("chunks", "WHERE active=1"),
+            "versions": q("document_versions"), "chunks": q("chunks", "WHERE active=1 AND quarantined=0 AND kind='chunk'"),
+            "summaries": q("chunks", "WHERE active=1 AND quarantined=0 AND kind!='chunk'"),
+            "quarantined": q("chunks", "WHERE quarantined=1 AND active=1"),
             "entities": q("entities"), "relations": q("relations", "WHERE active=1"),
             "relations_historic": q("relations", "WHERE active=0"),
         }

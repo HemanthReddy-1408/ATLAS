@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
 import httpx
 
-from .agent import AgentRun, ResearchAgent
+from .agent import AgentRun, AskOptions, ResearchAgent
+from .autonomous import ToolAgent
 from .clock import Clock
 from .config import Settings
+from .conversation import Conversation, SemanticCache, chat
 from .domain import Source
 from .fixtures import FixtureSite, fixture_sources
 from .generate import AnswerGenerator, ClaimVerifier, ContextBuilder
+from .graphrag import GraphRAG
 from .indexes import IndexManager, make_embedder
-from .llm import LLM, make_llm
+from .llm import LLM, LLMError, make_llm
+from .multiagent import Supervisor
 from .pipeline import RunReport, Updater
 from .process import EntityResolver, RelationExtractor
 from .query import QueryUnderstanding, route
@@ -41,7 +46,11 @@ class Atlas:
         self.generator = AnswerGenerator(self.idx, self.settings, self.llm)
         self.verifier = ClaimVerifier()
         self.updater = Updater(self.repo, self.resolver, self.extractor, self.idx, self.settings, self.clock)
+        self.graphrag = GraphRAG(self.repo, self.idx, self.clock)
         self.agent = ResearchAgent(self)
+        self.tool_agent = ToolAgent(self)
+        self.supervisor = Supervisor(self)
+        self.cache = SemanticCache(self)
 
     # ------------------------------------------------------------ ingest
     def register_sources(self, sources: list[Source]) -> None:
@@ -49,7 +58,10 @@ class Atlas:
             self.repo.upsert_source(s)
 
     async def ingest(self, transport: httpx.AsyncBaseTransport | None = None, max_pages: int = 500) -> RunReport:
-        return await self.updater.run(transport, max_pages)
+        rep = await self.updater.run(transport, max_pages)
+        if rep.new_docs or rep.changed_docs or rep.gone_docs:  # the graph moved: refresh community summaries
+            self.graphrag.rebuild()
+        return rep
 
     def ingest_sync(self, transport: httpx.AsyncBaseTransport | None = None, max_pages: int = 500) -> RunReport:
         return asyncio.run(self.ingest(transport, max_pages))
@@ -63,9 +75,26 @@ class Atlas:
         return self.ingest_sync(site.transport())
 
     # ---------------------------------------------------------- querying
-    def ask(self, question: str, *, use_llm: bool = True, max_iterations: int | None = None, llm_judge: bool = False) -> AgentRun:
-        return self.agent.run(question, use_llm=use_llm and self.llm is not None, max_iterations=max_iterations,
-                              llm_judge=llm_judge)
+    def ask(self, question: str, *, use_llm: bool = True, max_iterations: int | None = None, llm_judge: bool = False,
+            options: AskOptions | None = None, trace=None, mode: str = "pipeline", history: list[dict] | None = None) -> AgentRun:
+        """mode: pipeline (workflow agent) | autonomous (LLM-driven tool calling) | multi-agent (planner/researchers/critic/writer)."""
+        opts = options or AskOptions(use_llm=use_llm, llm_judge=llm_judge, max_iterations=max_iterations)
+        if options is not None:
+            opts = dataclasses.replace(opts, use_llm=opts.use_llm and use_llm)
+        if mode == "autonomous":
+            if self.llm is None or not opts.use_llm:
+                mode = "pipeline"  # no model to drive the tools: fall back to the deterministic workflow
+            else:
+                try:
+                    return self.tool_agent.run(question, history=history, trace=trace, options=opts)
+                except LLMError:
+                    mode = "pipeline"  # rate limit / provider error mid-run: degrade, don't fail
+        if mode == "multi-agent":
+            return self.supervisor.run(question, opts, trace)
+        return self.agent.run(question, use_llm=opts.use_llm and self.llm is not None, options=opts, trace=trace)
+
+    def chat(self, conv: Conversation, text: str, **kw) -> AgentRun:
+        return chat(self, conv, text, **kw)
 
     def search(self, question: str, mode: str = "hybrid", k: int = 10, filters: Filters | None = None) -> list[str]:
         """Single-shot retrieval returning ranked chunk ids. Modes: bm25 | dense | graph | rrf | hybrid."""

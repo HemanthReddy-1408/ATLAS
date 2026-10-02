@@ -32,14 +32,12 @@ def app(tmp_path, monkeypatch):
 
 def test_app_renders_every_tab_without_exceptions(app):
     assert not app.exception
-    assert len(app.tabs) >= 6
+    assert len(app.tabs) >= 8
     assert any("Documents" in m.label for m in app.sidebar.metric)
 
 
 def test_asking_a_question_renders_answer_evidence_and_claims(app):
-    app.text_area(key="q").set_value("Which companies partner with NVIDIA and also build AI accelerators?")
-    next(b for b in app.button if b.label == "Ask Atlas").click()
-    app.run()
+    app.chat_input[0].set_value("Which companies partner with NVIDIA and also build AI accelerators?").run()
     assert not app.exception
     md = " ".join(m.value for m in app.markdown)
     assert "Microsoft" in md and "[E" in md

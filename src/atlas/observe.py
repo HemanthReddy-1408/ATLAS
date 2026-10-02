@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from collections import defaultdict
@@ -23,6 +24,12 @@ class Trace:
     def __init__(self) -> None:
         self.t0 = time.perf_counter()
         self.spans: list[Span] = []
+        self.listeners: list = []  # callables(Span) invoked as each span finishes (live UI progress)
+
+    def _emit(self, sp: Span) -> None:
+        for fn in self.listeners:
+            with contextlib.suppress(Exception):  # a broken listener must never break the pipeline
+                fn(sp)
 
     @contextmanager
     def span(self, name: str, **attrs):
@@ -33,9 +40,12 @@ class Trace:
         finally:
             sp.duration_ms = (time.perf_counter() - self.t0) * 1e3 - sp.start_ms
             METRICS.observe(f"span_ms.{name}", sp.duration_ms)
+            self._emit(sp)
 
     def event(self, name: str, **attrs) -> None:
-        self.spans.append(Span(name, (time.perf_counter() - self.t0) * 1e3, 0.0, dict(attrs)))
+        sp = Span(name, (time.perf_counter() - self.t0) * 1e3, 0.0, dict(attrs))
+        self.spans.append(sp)
+        self._emit(sp)
 
     @property
     def total_ms(self) -> float:

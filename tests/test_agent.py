@@ -278,3 +278,34 @@ def test_failure_attribution_localises_the_failing_stage(corpus):
     for st in run.steps:
         st.result.trace.lists = {}
     assert attribute_failure(corpus, item, run, 0.0, 1.0)[0] == "RETRIEVAL"
+
+
+def test_patient_context_extends_and_restores_the_rate_limit_wait():
+    from atlas.llm import patient
+
+    llm = groq(lambda r: ok("x"))
+    before = llm.max_wait_s
+    with patient(llm, 500):
+        assert llm.max_wait_s == 500
+    assert llm.max_wait_s == before
+
+
+def test_empty_reasoning_only_completions_are_retried_with_a_bigger_budget():
+    budgets = []
+
+    def h(req):
+        body = json.loads(req.content)
+        budgets.append(body["max_completion_tokens"])
+        return ok("" if len(budgets) == 1 else "answer")
+
+    assert groq(h).complete("s", "p", max_tokens=100) == "answer" and budgets[1] == 2 * budgets[0]
+
+
+def test_generator_fallback_reason_is_visible_in_the_trace(corpus):
+    corpus.generator.llm = FakeLLM(responses=[])
+    try:
+        run = corpus.agent.run("Who developed Mixtral?", use_llm=True)
+    finally:
+        corpus.generator.llm = None
+    gen = next(s for s in run.trace.spans if s.name == "generate")
+    assert gen.attrs["mode"] == "extractive" and "no scripted response" in gen.attrs["llm_fallback"]

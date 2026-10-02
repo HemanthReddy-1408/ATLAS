@@ -229,6 +229,7 @@ class SubQuestion:
     date_from: str | None = None
     date_to: str | None = None
     label: str = ""
+    gap: list[str] = field(default_factory=list)  # terms the knowledge base has never seen (set by the agent's gap check)
 
 
 def decompose(a: QueryAnalysis, resolver: EntityResolver, llm: LLM | None = None) -> list[SubQuestion]:
@@ -248,7 +249,14 @@ def decompose(a: QueryAnalysis, resolver: EntityResolver, llm: LLM | None = None
     if a.qtype == QueryType.COMPARATIVE and len(a.entity_ids) >= 2:
         name_tokens = {t.lower() for nm in a.entity_names for t in re.findall(r"[A-Za-z0-9.\-+]+", nm)}
         rest = " ".join(k for k in a.keywords if k.lower() not in name_tokens and k.lower() not in {"and", "or", "vs"})
-        for n, (eid, name) in enumerate(zip(a.entity_ids, a.entity_names), 1):
+        pairs = list(zip(a.entity_ids, a.entity_names))
+        by_type: dict[str, list] = {}
+        for eid, name in pairs:  # compare like with like: "Llama 3.1 vs Mistral 7B" → the two models, not also "Meta"
+            by_type.setdefault(a.entity_types.get(eid, ""), []).append((eid, name))
+        like = max(by_type.values(), key=len)
+        if len(like) >= 2:
+            pairs = like
+        for n, (eid, name) in enumerate(pairs, 1):
             subs.append(SubQuestion(f"s{n}", f"{name} {rest or 'release architecture parameters benchmarks license'}", "entity", [eid], label=name))
     elif len(a.clauses) > 1:
         for i, c in enumerate(a.clauses, 1):
@@ -311,6 +319,9 @@ def route(a: QueryAnalysis, llm_available: bool = False) -> RetrievalConfig:
         why.append("factual → BM25 + dense")
     if a.complex:
         cfg.decompose = True
+    if t == QueryType.EXPLORATORY or re.search(r"\b(landscape|ecosystem|overall|big picture|main themes?|trends?|key players|industry|state of)\b", a.original.lower()):
+        cfg.include_summaries = True
+        why.append("broad question → community/document summary nodes enabled")
     if a.technical:
         cfg.weights["bm25"] = cfg.weights.get("bm25", 1.0) + 0.5
         why.append("technical terms → BM25 boosted")

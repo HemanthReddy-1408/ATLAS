@@ -1,10 +1,11 @@
-"""LLM access. Groq's OpenAI-compatible API, with rate limiting, caching and graceful failure.
+"""LLM access. Groq's OpenAI-compatible API, with rate limiting, caching, function calling and graceful failure.
 
 Every LLM-assisted step in Atlas has a deterministic fallback, so an `LLMError` degrades quality, never availability.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -37,12 +38,37 @@ class LLMStats:
         return dict(self.__dict__)
 
 
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict
+
+
+@dataclass
+class ChatMessage:
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+    def as_message(self) -> dict:
+        """The assistant turn in OpenAI wire format, to be appended to the running transcript."""
+        m: dict = {"role": "assistant", "content": self.content or ""}
+        if self.tool_calls:
+            m["tool_calls"] = [{"id": t.id, "type": "function", "function": {"name": t.name, "arguments": json.dumps(t.arguments)}}
+                               for t in self.tool_calls]
+        return m
+
+
 class LLM:
     model = "none"
     stats: LLMStats
 
     def complete(self, system: str, prompt: str, *, json_mode: bool = False, max_tokens: int = 900,
                  temperature: float = 0.1, fast: bool = False) -> str:
+        raise NotImplementedError
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, *, max_tokens: int = 700,
+             temperature: float = 0.1, fast: bool = False) -> ChatMessage:
         raise NotImplementedError
 
     def complete_json(self, system: str, prompt: str, **kw) -> dict | list:
@@ -101,29 +127,14 @@ class GroqLLM(LLM):
         self.stats = LLMStats()
         self._cache: dict[str, str] = {}
         self._limiter = _Limiter(int(os.environ.get("ATLAS_GROQ_RPM_LIMIT", 30)), int(os.environ.get("ATLAS_GROQ_TPM_LIMIT", 6000)))
-        self.max_wait_s = 50.0
+        self.max_wait_s = float(os.environ.get("ATLAS_LLM_MAX_WAIT_S", 75))
 
-    def complete(self, system: str, prompt: str, *, json_mode: bool = False, max_tokens: int = 900,
-                 temperature: float = 0.1, fast: bool = False) -> str:
-        model = self.fast_model if fast else self.model
-        key = hashlib.sha256(json.dumps([model, system, prompt, json_mode, max_tokens, temperature]).encode()).hexdigest()
-        if key in self._cache:
-            self.stats.cache_hits += 1
-            return self._cache[key]
-        body: dict = {
-            "model": model, "temperature": temperature, "max_completion_tokens": max_tokens,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-        }
-        if "gpt-oss" in model:
-            body["reasoning_effort"] = "low"
-            body["max_completion_tokens"] = max_tokens + 400  # reasoning tokens count against the budget
-        if json_mode:
-            body["response_format"] = {"type": "json_object"}
-        est = (len(system) + len(prompt)) // 4 + body["max_completion_tokens"] // 2
+    # -- transport shared by complete() and chat()
+    def _post(self, body: dict, est_tokens: int) -> dict:
         t0 = time.monotonic()
         last = "unknown"
         for attempt in range(3):
-            self.stats.waited_s += self._limiter.reserve(est, self.max_wait_s)
+            self.stats.waited_s += self._limiter.reserve(est_tokens, self.max_wait_s)
             try:
                 r = self.client.post("/chat/completions", json=body)
             except httpx.HTTPError as e:
@@ -132,17 +143,12 @@ class GroqLLM(LLM):
                 continue
             if r.status_code == 200:
                 data = r.json()
-                text = data["choices"][0]["message"].get("content") or ""
-                text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
                 u = data.get("usage", {})
                 self.stats.calls += 1
                 self.stats.prompt_tokens += u.get("prompt_tokens", 0)
                 self.stats.completion_tokens += u.get("completion_tokens", 0)
                 self.stats.seconds += time.monotonic() - t0
-                if not text:
-                    raise LLMError("empty completion (token budget likely spent on reasoning)")
-                self._cache[key] = text
-                return text
+                return data
             last = f"HTTP {r.status_code}: {r.text[:200]}"
             if r.status_code in (429, 500, 502, 503):
                 ra = r.headers.get("retry-after")
@@ -152,14 +158,68 @@ class GroqLLM(LLM):
         self.stats.errors += 1
         raise LLMError(last)
 
+    def _body(self, model: str, messages: list[dict], max_tokens: int, temperature: float) -> dict:
+        body: dict = {"model": model, "temperature": temperature, "max_completion_tokens": max_tokens, "messages": messages}
+        if "gpt-oss" in model:
+            body["reasoning_effort"] = "low"
+            body["max_completion_tokens"] = max_tokens + 400  # reasoning tokens count against the budget
+        return body
+
+    def complete(self, system: str, prompt: str, *, json_mode: bool = False, max_tokens: int = 900,
+                 temperature: float = 0.1, fast: bool = False) -> str:
+        model = self.fast_model if fast else self.model
+        key = hashlib.sha256(json.dumps([model, system, prompt, json_mode, max_tokens, temperature]).encode()).hexdigest()
+        if key in self._cache:
+            self.stats.cache_hits += 1
+            return self._cache[key]
+        body = self._body(model, [{"role": "system", "content": system}, {"role": "user", "content": prompt}], max_tokens, temperature)
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        est = (len(system) + len(prompt)) // 4 + body["max_completion_tokens"] // 2
+        text = ""
+        for _attempt in range(2):  # reasoning models can spend the whole budget thinking: retry once with room to answer
+            data = self._post(body, est)
+            text = re.sub(r"<think>.*?</think>", "", data["choices"][0]["message"].get("content") or "", flags=re.S).strip()
+            if text:
+                break
+            body["max_completion_tokens"] = int(body["max_completion_tokens"] * 2)
+        if not text:
+            raise LLMError("empty completion (token budget likely spent on reasoning)")
+        self._cache[key] = text
+        return text
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, *, max_tokens: int = 700,
+             temperature: float = 0.1, fast: bool = False) -> ChatMessage:
+        model = self.fast_model if fast else self.model
+        body = self._body(model, messages, max_tokens, temperature)
+        if tools:
+            body["tools"], body["tool_choice"] = tools, "auto"
+        est = len(json.dumps(messages)) // 4 + (len(json.dumps(tools)) // 4 if tools else 0) + body["max_completion_tokens"] // 3
+        data = self._post(body, est)
+        msg = data["choices"][0]["message"]
+        calls = []
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            calls.append(ToolCall(tc.get("id") or f"call_{len(calls)}", fn.get("name", ""), args if isinstance(args, dict) else {}))
+        content = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S).strip()
+        if not content and not calls:
+            raise LLMError("empty chat completion")
+        return ChatMessage(content, calls)
+
 
 @dataclass
 class FakeLLM(LLM):
-    """Scripted LLM for tests: responses are popped in order, or produced by `fn(system, prompt)`."""
+    """Scripted LLM for tests. `responses`/`fn` drive complete(); `chat_script` (ChatMessage items or callables) drives chat()."""
 
     responses: list[str] = field(default_factory=list)
     fn: object = None
+    chat_script: list = field(default_factory=list)
     calls: list[tuple[str, str]] = field(default_factory=list)
+    chats: list[list[dict]] = field(default_factory=list)
     model: str = "fake"
     stats: LLMStats = field(default_factory=LLMStats)
 
@@ -171,6 +231,27 @@ class FakeLLM(LLM):
         if not self.responses:
             raise LLMError("no scripted response")
         return self.responses.pop(0)
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, **kw) -> ChatMessage:
+        self.chats.append([dict(m) for m in messages])
+        self.stats.calls += 1
+        if not self.chat_script:
+            raise LLMError("no scripted chat response")
+        item = self.chat_script.pop(0)
+        return item(messages, tools) if callable(item) else item
+
+
+@contextlib.contextmanager
+def patient(llm: LLM | None, seconds: float = 240.0):
+    """Batch jobs (judge, synthetic data, multi-step agents) may wait out a small tokens-per-minute tier instead of failing."""
+    old = getattr(llm, "max_wait_s", None)
+    if old is not None:
+        llm.max_wait_s = max(old, seconds)  # type: ignore[union-attr]
+    try:
+        yield llm
+    finally:
+        if old is not None:
+            llm.max_wait_s = old  # type: ignore[union-attr]
 
 
 def make_llm(s: Settings) -> LLM | None:
